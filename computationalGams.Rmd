@@ -1,0 +1,986 @@
+---
+title: "Some practical computational aspects of non-parametric (distributional) regression"
+author: "Ilaria Prosdocimi - Ca' Foscari University of Venice"
+date: "2023-03-06"
+output:
+  html_document:
+            toc: true
+            toc_float: true
+            toc_collapsed: true
+            toc_depth: 3
+            code_folding: hide
+---
+
+## Preliminaries - data 
+
+We'll make use of some dataset in the course of the session - mostly datasets avaiable in R packages, other than the data regarding the climate station at Hohenpeissenberg, in Germany, which is obtained from the DWD, the german climate office. 
+
+
+```{r, include=TRUE}
+climDat <- read.csv(file = "Hohenpeissenberg.csv", header = TRUE)
+# climDat <- read.csv(file = "climateZug.csv", header = TRUE)
+# with(climDat,plot(month,TMean))
+# take yearly values 
+yclimDat <- aggregate(climDat[,c("Precip","TMean","year")], by = list(climDat$year),FUN = mean, na.rm = TRUE)[,c("Precip","TMean","year")]
+yclimDat$sYear <- (yclimDat$year-min(yclimDat$year))/diff(range(yclimDat$year))
+yclimDat <- na.omit(yclimDat)
+```
+
+We will also use the following dataset: 
+
+```{r}
+data("airquality", package = "datasets")
+data("mcycle", package = "MASS")
+# this one might require you to install the package 
+data("ethanol", package = "SemiPar")
+# or load the data save in the repo manually
+# write.table(ethanol, "ethanol.csv",sep=",",quote = FALSE)
+```
+
+
+
+## Refernces and inspirations
+
+Key introduction books: 
+
+Wood, Simon N. (2017) Generalized Additive Models: An Introduction with R, CRC, 2nd edition
+
+Eilers, P.H.C. and Marx, B.D. (2021). Practical Smoothing, The Joys of P-splines. Cambridge University Press. ([book website](https://psplines.bitbucket.io))
+
+Harezlak, J., Ruppert, D. and Wand, M.P., 2018. Semiparametric regression with R. New York: Springer. 
+
+This latter book is the "follow-up" of 
+
+Ruppert, D., Wand, M.P. and Carroll, R.J., 2003. Semiparametric regression. Cambridge university press.
+
+Some slightly different philosophies to non-/semi-parametric regression presented in these books: they are all similar but there are some differences in the estimation approaches. 
+
+The first original reference for Generalized Additive Models is 
+
+Hastie, T. and Tibshirani, R., 1987. Generalized additive models: some applications. Journal of the American Statistical Association, 82(398), pp.371-386. 
+
+which resulted in the book 
+
+Hastie, T. and Tibshirani, R., 1990. Generalized additive models: some applications. CRC Press
+
+but the Hastie and Tibshirani book/approach has been somewhat superseded (even if it is still valid, useful and relevant).
+
+Key references on distributional regression/Structured Additive Regression (STAR) Models are: 
+
+Stasinopoulos et al (2017), Flexible Regression and Smoothing: Using  GAMLSS  in R, CRC 
+
+Fahrmeir L, Kneib T, Lang S, Marx B (2013). Regression – Models, Methods and Applications. Springer-Verlag, Berlin.
+
+An additional useful reference is: 
+
+Thomas W. Yee (2015). Vector Generalized Linear and Additive Models: With an Implementation in R. New York, USA: Springer.
+
+The journal Statistical Modelling published a [special issue](https://journals.sagepub.com/toc/smja/18/3-4) on the topic of flexible models for extending the classical (generalized) linear model framework with very practical tutorials on a number of extensions: most of these papers are very accessible and well written by leading experts on the topic. 
+
+Today I will focus on some practical aspects of how these models are estimated in practice, which hopefully will help in understanding how they work.
+
+## Why bother? 
+
+The linear/polynomial model sometime is not flexible enough to model data which have particular features: 
+
+```{r cars}
+data(mcycle, package = "MASS")
+# help(mcycle, package = "MASS")
+plot(mcycle, pch = 16, col = "grey40")
+nd <- data.frame(times = seq(2.4,57.6,by=0.1))
+lines(nd$times, predict(lm(accel ~ times, data = mcycle), newdata = nd))
+# doesn't cut it 
+lines(nd$times, predict(lm(accel ~ poly(times,4), data = mcycle), newdata = nd), col = 4)
+# not complex enough
+lines(nd$times, predict(lm(accel ~ poly(times,6), data = mcycle), newdata = nd), col = 6)
+rm(nd)
+```
+
+The fit is not particularity good and it is too wiggly in many parts of the domain. 
+
+Furthermore polynomial regression is "global": 
+
+```{r}
+plot(mcycle, pch = 16, col = "orange2")
+with(mcycle,lines(times, predict(lm(accel ~ poly(times,6))), col = 2, lwd = 1.4))
+# differences are visible also at locations for high "times"
+with(mcycle[mcycle$times <5,],points(accel ~ times, col = "grey40"))
+with(mcycle[mcycle$times >5,],lines(times, predict(lm(accel ~ poly(times,6))), col = 4, lwd = 1.4))
+```
+
+Not including a tiny amount of the sample with low $x$ values changes the fit for the whole function, even for high $x$ values. 
+
+Even a piece-wise linear model can be not really flexible enough (and would not allow for a continuous derivative). We therefore need to find a way to obtain some smooth fit, which is flexible as the polynomial fit can be but less impacted by the global behavior of polynomials. 
+
+Exercise 2 of Chapter 4 in Wood's book gives an illuminating example about the local/global issue and how some local splines can overcome the problem (code slightly modified). We generate some noisy smooth data, try to fit them with polynomial fits and compare the interpolation properties of the polynomial fit with that obtained from a (regression) cubic spline basis of the shape: 
+$$b_1(x) = 1, \ b_2(x) = x, \ b_{j+2}(x) = |x - x^*_j|^3, \text{ for } j= 1, \ldots, q-2$$
+where $q$ is the basis dimension and $x^*_j$ are the knots locations (we'll talk more about this later). We'll take $q = 11$ and equally spaced knots over the range of $x$ values:
+ 
+```{r}
+# generate some noisy smooth data 
+set.seed(1)
+n <- 40
+x <-sort(runif(n)*10)^.5
+y <-sort(runif(n))^.1
+plot(x,y, pch = 16, col = "grey40")
+# estimate polynomial models and then use the model fit to interpolate 
+nd <- data.frame(x = seq(0,4,by=0.05))
+lines(nd$x, predict(lm(y ~ poly(x,5)), newdata = nd), col = 2)
+lines(nd$x, predict(lm(y ~ poly(x,10)), newdata = nd), col = 4) # ups 
+# define some cubic splines over knots 
+cubSpline <- function(x, knots=NULL){ 
+  X <- cbind(rep(1,length(x)), x)
+  for(j in seq_along(knots)) X <- cbind(X, (abs(x-knots[j]))^3)
+  X
+} 
+# define the knots 
+xknots <-  seq(min(x),max(x), length.out = 9) # equally spaced 
+lines(nd$x, cubSpline(nd$x, knots =  xknots) %*% coef(lm(y ~ cubSpline(x, knots =  xknots)-1)), col = "orange2")
+legend("bottomright",bty = "n", col = c(2,4,"orange2"), legend = c("poly(5)","poly(10)","cubSpline"), lwd = 1.3)
+rm(x,y,n,nd,xknots)
+```
+
+The fit obtained with the spline is flexible enough to capture the smooth relationship and does not have issues when interpolating in data sparse regions - let's see what would happen to the `mcycle` data: 
+
+
+```{r}
+# defined the knots 
+xknots <-  seq(min(mcycle$times),max(mcycle$times), length.out = 9) # equally spaced 
+plot(mcycle, pch = 16, col = rgb(0.93,0.60,0,0.6))
+with(mcycle[mcycle$times <5,],points(accel ~ times, col = "grey40"))
+with(mcycle,lines(times, predict(lm(accel ~ cubSpline(times,xknots)-1)), col = "purple3", lwd = 1.3))
+# basically same fit for areas which are in both training sets
+with(mcycle[mcycle$times >5,],lines(times, predict(lm(accel ~ cubSpline(times,xknots)-1)), col = 4, lwd = 1.3, lty = 2))
+```
+
+
+Notice this is achieved using `lm`, we are simply fitting the usual linear model but using a custom-defined $\boldsymbol{X}$ matrix. So, how is the nice local behavior of the spline-based fit achieved? 
+
+Let's look closely at the basis function: 
+
+$$\text{Polynomial basis:} \ b_1(x) = 1, \ b_2(x) = x, \ b_3(x) = x^2 \ b_{j}(x) = x^{j-1}, \text{ for } j= 1, \ldots, d$$
+
+$$\text{Cubic spline basis:} \ b_1(x) = 1, \ b_2(x) = x, \ b_{j+2}(x) = |x - x^*_j|^3, \text{ for } j= 1, \ldots, q-2$$
+
+
+Let's plot the different columns of $\boldsymbol{X}$: 
+
+```{r}
+par(mfrow = c(1,2))
+# polynomial matrix d = 6
+poly6matrix <- with(mcycle, model.matrix(accel ~ poly(times,6)))
+# cubic spline 
+cSmatrix <- with(mcycle, model.matrix(accel ~ cubSpline(times,xknots)-1))
+plot(mcycle$times,poly6matrix[,1], type = "l", ylim = range(poly6matrix))
+for(j in 2:ncol(poly6matrix)) lines(mcycle$times,poly6matrix[,j],col = j)
+plot(mcycle$times,cSmatrix[,1], type = "l", ylim = range(cSmatrix)) #, ylim = c(-0.6,15))
+for(j in 2:ncol(cSmatrix)) lines(mcycle$times,cSmatrix[,j],col = j)
+points(xknots,rep(-.1,9),pch = 4)
+rm(xknots,cSmatrix,j,poly6matrix)
+```
+
+
+The cubic basis are more local depending on the knot to which the refer to. This is similar to what happens when using loess or kernel methods: local fits are not affected by what happens in other parts of the sample. The advantage (one of) of smoothing by splines is the relative ease of estimation, since we can exploit routines developed for (penalized) regression since all we are doing is using a specific basis as our design matrix. There are several possible choices of basis functions, the choice of which spline to use in GAM fitting can be quite important, especially when combined with the second element of GAMS: the penalty. We'll walk trough this using even simpler basis functions (the presentation of the material follows chapter 4 of Wood, 2017).  
+
+
+
+## Univariate Smoothers  
+
+Let's start with a much simpler basis function than the cubic splines seen in action above and use a piecewise linear basis. We need to define a set of _knots_ $(x^*_1, \ldots, x^*_k)$ (with $x^*_{j} > x^*_{j-1}$), i.e. the points at which the piece-wise linear pieces will join and that are the location of the function discontinuities. Then for $j = 2, \ldots, k-1$ we have
+
+$$b_j(x) =  \begin{cases}
+   \frac{x-x^*_{j-1}}{x^*_{j}-x^*_{j-1}}  & x^*_{j-1} < x < x^*_{j} \\
+   \frac{x^*_{j+1}-x}{x^*_{j+1}-x^*_{j}}  & x^*_{j} < x < x^*_{j+1} \\ 
+                0                         &      \text{otherwise}   \\ 
+  \end{cases}$$
+ 
+and for $j=1$ and $j=k$ we take
+
+$$b_1(x) =  \begin{cases}
+   \frac{x^*_{2}-x}{x^*_{2}-x^*_{1}}  & x < x^*_{2} \\
+                0                         &      \text{otherwise}   \\ 
+  \end{cases} \qquad b_k(x) = \begin{cases}
+   \frac{x-x^*_{k-1}}{x^*_{k}-x^*_{k-1}}  & x > x^*_{k-1} \\
+                0                         &      \text{otherwise}   \\ 
+  \end{cases}$$
+ 
+This definition produces what is termed the _tent functions_, since they take value of 0 everywhere except between $(x^*_{j-1},x^*_{j+1})$: from $x^*_{j-1}$ they grow linearly, reach a peak value of 1 at $x^*_{j}$ and then decrease linearly till $x^*_{j+1}$. They can also be thought of the linear interpolator of the data ${x^*_{i}, \delta^j_i : i = 1, \ldots, k}$, where $\delta^j_i = 1$ if $i=j$ and 0 otherwise. Let's build it in R:
+
+```{r}
+# for a set of knots, build the jth basis 
+tf <- function(x, knots, j){
+  deltai <- rep(0, length(knots)); deltai[j] <- 1 
+  approx(x = knots, y = deltai, xout = x)$y
+}
+par(mfrow=c(1,2))
+# one tent function 
+with(mcycle,plot(times, tf(times, seq(5,60,by=5),j=5), type = "l"))
+#  the whole basis
+with(mcycle,plot(times, tf(times, seq(5,60,by=5),j=1), type = "l"))
+for(j in 2:9) with(mcycle,lines(times, tf(times, seq(5,60,by=5),j=j), col = j, type = "l"))
+```
+
+We can use this to construct a design matrix $\boldsymbol{X}$ to use for smoothing: 
+
+```{r}
+tf.X <- function(x,knots){
+  nk <- length(knots); n <- length(x)
+  X <- matrix(NA, nrow = n, ncol = nk)
+  for(j in 1:nk) X[,j] <- tf(x, knots, j=j)
+  X
+}
+Xtf_mcycle <- tf.X(mcycle$times, knots = seq(0,60,by=5))
+fittf_mcycle <- lm(mcycle$accel ~ Xtf_mcycle-1)
+plot(mcycle, pch = 16, col = "grey60")
+valX <- tf.X(seq(3,60,by=0.5), knots = seq(0,60,by=5))
+lines(seq(3,60,by=0.5), valX %*% coef(fittf_mcycle), col = 2)
+points(seq(0,60,by=5), rep(-140,13),col=4,pch=4)
+rm(Xtf_mcycle,fittf_mcycle,valX)
+```
+
+
+The fitted line captures the overall behavior of the data, but the number of knots (and consequently the possible complexity of the shape of the function/ the number of estimated parameters) was fixed arbitrarily. 
+We could think of using some model selection approach, but the implementation of this could be cumbersome, so we prefer to use a largish number of knots/basis dimension and to control the model smoothness via a penalty that controls the wiggliness of the fitted function. For example we could measure the fitted function's wiggliness as the squared second difference of the function at the knots: 
+$$w_j = (f(x^*_{j+1})-f(x^*_{j})-(f(x^*_{j})-f(x^*_{j-1})))^2 = (f(x^*_{j+1})-2 f(x^*_{j})-f(x^*_{j-1}))^2$$
+This is a crude approximation of the second derivative penalty used in (cubic) spline smoothing (taking equally spaced knots).
+
+We wish to obtain a fitted function such that it is not too wiggly, which corresponds to constraining the optimization with the constraint that $\sum_{j=2}^{k-1}w_j < C$, where $C$ is a fixed constant which controls the wiggliness of the function: large values of $C$ would correspond to wiggly curves. 
+
+Using the Lagrangian approach to optimization under constraints we therefore find that the we wish to minimize the following quantity: 
+$$||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \lambda \sum_{j=1}^{k-1}w_j$$
+(notice that the wiggliness is evaluated for $k-2$ points). 
+
+Finally, for the tent function we notice that $f(x^*_j) = \beta_j$, so we can write: $w_j = (\beta_{j-1} - 2 \beta_j +\beta_{j+1})$, which we need to evaluate for $j=2, \ldots, k-1$. This makes it possible to write the penalty term in matrix form, since: 
+
+$$\begin{bmatrix}
+\beta_1 - 2 \beta_2 + \beta_3 \\
+\beta_2 - 2 \beta_3 + \beta_4 \\
+\vdots \\ 
+\beta_{k-2} - 2 \beta_{k-1} + \beta_k \\
+\end{bmatrix} = \begin{bmatrix}
+1  & - 2 & 1   & \cdots  & \cdots & \cdots \\
+0  & 1   & - 2 &    1    & \cdots & \cdots \\
+ \vdots & \vdots & \vdots  & \vdots   & \vdots &  \vdots \\
+ \cdots & \cdots & \cdots  & 1   & - 2 &   1
+\end{bmatrix} \boldsymbol{\beta} = \boldsymbol{D} \boldsymbol{\beta}$$
+
+and we can write
+
+$$\sum_{j=1}^{k-1} w_j = \boldsymbol{\beta}^\top \boldsymbol{D}^\top \boldsymbol{D} \boldsymbol{\beta}$$
+and taking $\boldsymbol{S} = \boldsymbol{D}^\top \boldsymbol{D}$ we rewrite the optimization problem as: 
+
+$$||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \lambda \boldsymbol{\beta}^\top \boldsymbol{S} \boldsymbol{\beta}$$
+
+which, for a fixed value of $\lambda$, leads to 
+
+$$\hat{\boldsymbol{\beta}} = \left(\boldsymbol{X}^T \boldsymbol{X}  + \lambda \boldsymbol{S} \right)^{-1} \boldsymbol{X}^T \boldsymbol{y}$$
+
+hence we find that the hat matrix such that $\hat{\boldsymbol{f}} = \boldsymbol{A} \boldsymbol{y}$ is $\boldsymbol{A} = \boldsymbol{X} \hat{\boldsymbol{\beta}} = \left(\boldsymbol{X}^T \boldsymbol{X}  + \lambda \boldsymbol{S} \right)^{-1} \boldsymbol{X}^T$. 
+
+Penalized regression splines thus lead to a linear smoother and we can derive the equivalent kernel for each observation $i$ as the $i^\text{th}$ row of the hat matrix. 
+
+Let's see the effect of $\lambda$ in practice. First we need to construct $\boldsymbol{S} = \boldsymbol{D}^\top \boldsymbol{D}$, which we can create using `diff`: 
+
+
+```{r}
+## an example
+diff(diag(5), differences = 2)
+# the design matrix
+Xtf_mcycle <- tf.X(mcycle$times, knots = seq(0,60,by=2))
+# let's create S 
+S <- t(diff(diag(ncol(Xtf_mcycle)), differences = 2)) %*% diff(diag(ncol(Xtf_mcycle)), differences = 2)
+## this is not the best way to compute this 
+hatf_05 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+.5*S) %*% t(Xtf_mcycle) %*% mcycle$accel
+hatf_50 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+50*S) %*% t(Xtf_mcycle) %*% mcycle$accel
+hatf_500 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+500*S) %*% t(Xtf_mcycle) %*% mcycle$accel
+plot(mcycle, pch = 16, col = "grey60")
+lines(mcycle$times, hatf_05, col = 4)
+lines(mcycle$times, hatf_50, col = 2)
+lines(mcycle$times, hatf_500, col = 6)
+legend("topleft",col = c(2,4,6), legend = c(.5,50,500),title = "lambda value",lwd=1.4)
+```
+
+Let's look at the equivalent kernels: 
+
+```{r}
+h05 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+.5*S) %*% t(Xtf_mcycle)
+h500 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+500*S) %*% t(Xtf_mcycle)
+par(mfrow=c(1,1))
+i = 10; plot(mcycle$times, h05[i,], col = 2, type = "l"); lines(mcycle$times, h500[i,], col = 4)
+i = 90; lines(mcycle$times, h05[i,], col = 2, lty = 2, type = "l"); lines(mcycle$times, h500[i,], col = 4, lty = 2)
+title(main = "Equivalent kernels")
+legend("topright", bty ="n",col=c(2,4),lwd = 1,legend = c("0.5","500"), title = "Lambda value")
+```
+
+
+A more computationally stable way of obtaining the penalized least square fit is to exploit the fact that: 
+
+$$||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \lambda \boldsymbol{\beta}^\top \boldsymbol{S} \boldsymbol{\beta} = \left\Vert  \begin{bmatrix} \boldsymbol{y} \\ \boldsymbol{0} \end{bmatrix} - \begin{bmatrix} \boldsymbol{X} \\ \sqrt{\lambda} D \end{bmatrix} \boldsymbol{\beta} \right\Vert^2$$
+
+so 
+
+
+```{r}
+X500augment <- rbind(Xtf_mcycle, sqrt(500) * diff(diag(ncol(Xtf_mcycle)), differences = 2))
+yaugment <- c(mcycle$accel, rep(0, ncol(Xtf_mcycle)-2))
+althatf_500 <- fitted(lm(yaugment ~ X500augment-1))
+hatf_500 <- Xtf_mcycle %*% solve(crossprod(Xtf_mcycle)+500*S) %*% t(Xtf_mcycle) %*% mcycle$accel
+head(althatf_500)
+head(hatf_500[,1])
+```
+
+since under the hood R uses an optimized $\boldsymbol{Q} \boldsymbol{R}$ decomposition for fitting linear models this procedure is more computationally stable (and in general using the $\boldsymbol{Q} \boldsymbol{R}$ decomposition for an augmented model is a good way to practically estimate $\boldsymbol{\beta}$ for a given $\lambda$). 
+
+We can indeed write a generic function to construct penalized regression estimates: 
+
+```{r}
+preg.fit <- function(y,x,knots,spar){
+  X<-tf.X(x, knots = knots) # design matrix 
+  D <- diff(diag(length(knots)),differences = 2)
+  Xaug <- rbind(X, sqrt(spar) * D)
+  yaugment <- c(y, rep(0, nrow(D)))
+  lm(yaugment ~ Xaug-1)
+}
+head(fitted(preg.fit(y = mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2), spar = 100)))
+```
+
+
+```{r,echo=FALSE}
+rm(hatf_05,hatf_50,hatf_500,S,Xtf_mcycle,X500augment,yaugment,althatf_500,i,h05,h500,j)
+```
+
+
+### Smoothing as Regularization 
+
+**penalized regression is regularized regression**
+
+Note that the form of the estimation of $\boldsymbol{\beta}$ for a given $\lambda$ has a very similar form of the estimated coefficients one would obtain when applying _ridge regression_, which is employed as a form of _regularization_ is regression problems in which either $p>n$ or in which there are issues of multi-collinearity in the predictors. In these situations one typically can not solve the system of equations required to obtain the least square estimate (and in practical terms one can not obtain $(\boldsymbol{X}^\top \boldsymbol{X})^{-1}$). Ridge regression overcomes this issue by placing a particular form of constraints on the parameters, which result in $\hat{\boldsymbol{\beta}}^{Ridge}$ to be chosen to minimize: 
+
+$$||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \lambda \boldsymbol{\beta}^\top \boldsymbol{\beta} = \sum_{i=1}^{n} (y_i - \sum_{j=1}^{p} x_{ij}\beta_j)^2+\lambda \sum_{j=1}^{p} \beta_j^2$$
+
+The penalty term results from constraining the sum of the squares of the regression coefficients to be smaller than a certain constant $C$: $\sum_{j=1}^{p} \beta^2_j \leq C$. 
+
+We find that: $\hat{\boldsymbol{\beta}}^{Ridge} = (\boldsymbol{X}^\top \boldsymbol{X} + \lambda \boldsymbol{I})^{-1}\boldsymbol{X}^\top \boldsymbol{y}$ and taking $\boldsymbol{R} = (\boldsymbol{X}^\top \boldsymbol{X})^{-1}$ we have that: 
+
+$$\hat{\boldsymbol{\beta}}^{Ridge} = (\boldsymbol{I} + \lambda \boldsymbol{R})^{-1}\hat{\boldsymbol{\beta}}^{LS}$$
+
+This shows that Ridge Regression (and in general penalized approaches) is biased (remember that $\hat{\boldsymbol{\beta}}^{LS}$ is unbiased) and that the least square estimate is retrieved when $\lambda = 0$, i.e. when no penalization is applied. Interestingly though the variance of $\hat{\boldsymbol{\beta}}^{Ridge}$ is found to be typically smaller than that of $\hat{\boldsymbol{\beta}}^{LS}$, and therefore ridge regression can be found to have smaller RMSE for finite samples. 
+
+Let's see ridge regression in action: 
+
+```{r}
+set.seed(441)
+n <- 6; p <- 10; # p > n
+X <- scale(matrix(runif(n*p,0,1),ncol = p))
+y <- rnorm(n,X %*% rnorm(p,0,2)); y <- y - mean(y)
+f_orig <- lm(y~X-1); coef(f_orig)
+f_ridge <- MASS::lm.ridge(y~X-1, lambda = 5); coef(f_ridge)
+par(mfrow=c(1,2),pch=16)
+plot(fitted(f_orig), y, xlab = "least square fit", ylab = "observed"); abline(0,1)
+plot(X %*% coef(f_ridge), y, xlab = "ridge fit", ylab = "observed"); abline(0,1)
+rm(n,X,y,p,f_orig,f_ridge)
+```
+
+Notice that Ridge Regression is also known under the name of Tikhonov regularization, and it is widely employed in the inverse problems literature (sometimes wheels are re-invented many times). 
+
+
+Another very famous form of regularization in regression models is the least absolute shrinkage and selection operator (lasso), which is derived when performing linear regression under the constraint: $\sum_{j=1}^{k} |\beta_j| < C$, which leads to estimates found by minimizing: 
+
+$$\sum_{i=1}^{n} (y_i - \sum_{j=1}^{p} x_{ij}\beta_j)^2+\lambda \sum_{j=1}^{p} |\beta_j|$$
+
+Due to the difference in the constraints under which the model parameters are derived ridge regression and lasso are often also identified as L2 and L1 regularized regression. 
+
+The key point for our purpose is to realize that smoothing by means of penalized regression splines is "nothing but" a regularized regression. 
+
+
+### Smoothing parameter choice 
+
+
+We now get to the tricky part of penalized regression splines (and regularized regression in general): choosing $\lambda$. There isn't a "best" way to choose $\lambda$, but there are some sensible metrics which can be used, such as cross-validation (CV), a generalized form of cross-validation (GCV), AIC and other likelihood and bayesian metrics which we don't discuss today. 
+
+We could think to a suitable way to choose $\lambda$ would be to find the value such that the fitted values are as close as possible to the observed vales, i.e. to minimize:  
+$$M = \frac{1}{n}\sum_{i=1}^{n} (\hat{m}_i - m_i)^2$$
+where $\hat{m}_i \equiv \hat{m}(x_i)$, $m_i \equiv m(x_i)$. Since $f(x)$ is unknown we can not compute $M$ but we can derive an estimate of it using the ordinary cross validation score defined as: 
+$$\mathcal{V}_o = \frac{1}{n}\sum_{i=1}^{n} (\hat{m}^{[-i]} - y_i)^2$$
+where $\hat{m}^{[-i]}$ is a fitted model derived when the observation $y_i$ is not included in the model. It can be shown that it is not actually necessary to hold-out the $i$th observation and iterate the estimation procedure $n$ times as we can derive that 
+$$\mathcal{V}_o = \frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{m}_{i})^2/(1-\boldsymbol{A}_{ii})^2$$
+where $A$ is the hat matrix of the model (which in the penalized regression spline case depends on $\lambda$). This simplification of the OCV which avoids needing to effectively hold-out the $i$th observation is only valid for the gaussian case. Let's see how $\mathcal{V}_o$ changes as a function of $\lambda$ using the `mcycle` data (and the same large number of knots used before): 
+
+
+```{r}
+ocv <- function(lambda, y, x,knots){
+  n <- length(y)
+  modelFit <- preg.fit(y = y, x = x, knots = knots, spar = lambda)
+  fval <- fitted(modelFit)[1:n]
+  hatValues <- hatvalues(modelFit)[1:n]
+  sum(((y-fval)/(1-hatValues))^2)
+}
+lambda_seq <- seq(.5,4,length.out = 16)
+ocv_seq <- rep(NA, length(lambda_seq))
+for(j in seq_along(lambda_seq)) ocv_seq[j] <- ocv(lambda_seq[j],y = mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2))
+par(mfrow = c(1,2), pch = 16)
+plot(lambda_seq, ocv_seq, type="l")
+plot(mcycle$times, mcycle$accel, col = "grey40")
+lines(mcycle$times, fitted(preg.fit(y =  mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2), spar = lambda_seq[which.min(ocv_seq)]))[1:nrow(mcycle)], col=2, lwd = 1.4)
+rm(lambda_seq, ocv_seq)
+```
+
+
+```{r}
+lambda_seq <- seq(1,20,length.out = 16)
+ocv_seq <- rep(NA, length(lambda_seq))
+for(j in seq_along(lambda_seq)) ocv_seq[j] <- ocv(lambda_seq[j],y = yclimDat$TMean, x = yclimDat$sYear, knots = seq(0,1,by=.05))
+par(mfrow = c(1,2), pch = 16)
+plot(lambda_seq, ocv_seq, type="l")
+plot(yclimDat$year, yclimDat$TMean,col="grey50")
+lines(yclimDat$year, fitted(preg.fit(y = yclimDat$TMean, x = yclimDat$sYear, knots = seq(0,1,by=.05), spar = lambda_seq[which.min(ocv_seq)]))[1:nrow(yclimDat)], col=2, lwd = 1.6)
+# numerical optimization of OCV
+ocv_opt <- optimise(ocv,y = yclimDat$TMean, x = yclimDat$sYear, knots = seq(0,1,by=.05), interval = c(0,500))
+lines(yclimDat$year, fitted(preg.fit(y = yclimDat$TMean, x = yclimDat$sYear, knots = seq(0,1,by=.05), spar = ocv_opt$minimum))[1:nrow(yclimDat)], col = 4, lwd = 1.6)
+rm(lambda_seq, ocv_seq)
+```
+
+
+Each observation in the dataset contributes to the computation of $\mathcal{V}_o$ with the model residual with a wight which depends on the hat value of the observation, i.e. a measure of how influential each observation will be. When highly influential observations are present in the data, these will be given a much higher weight, which intuitively might be a bad idea. For this and other reasons, a modification of the OCV is proposed, the so-called, Generalized Cross Validation (GCV), in which each element $\boldsymbol{A}_{ii}$ is replaced by $tr(\boldsymbol{A})/n$. We therefore define: 
+$$\mathcal{V}_g = \frac{1}{n}  \sum_{i=1}^{n} \frac{(y_i - \hat{m}_{i})^2}{(1-tr(\boldsymbol{A})/n)^2}$$
+
+Let's see it in action: 
+
+```{r}
+gcv <- function(lambda, y, x,knots){
+  n <- length(y)
+  modelFit <- preg.fit(y = y, x = x, knots = knots, spar = lambda)
+  fval <- fitted(modelFit)[1:n]
+  hatValues <- hatvalues(modelFit)[1:n]
+  (sum((y-fval)^2)/n)/((1-sum(hatValues)/n)^2)
+}
+lambda_seq <- seq(.5,4,length.out = 16)
+gcv_seq <- ocv_seq <- rep(NA, length(lambda_seq))
+for(j in seq_along(lambda_seq)) ocv_seq[j] <- ocv(lambda_seq[j],y = mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2))
+for(j in seq_along(lambda_seq)) gcv_seq[j] <- gcv(lambda_seq[j],y = mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2))
+par(mfrow = c(1,3), pch = 16)
+plot(lambda_seq, ocv_seq, type="l"); points(lambda_seq[which.min(ocv_seq)], min(ocv_seq), pch = 4, col = 2)
+plot(lambda_seq, gcv_seq, type="l"); points(lambda_seq[which.min(gcv_seq)], min(gcv_seq), pch = 4, col = 2)
+plot(mcycle$times, mcycle$accel, col = "grey40")
+lines(mcycle$times, fitted(preg.fit(y =  mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2), spar = lambda_seq[which.min(ocv_seq)]))[1:nrow(mcycle)], col=2, lwd = 1.4)
+lines(mcycle$times, fitted(preg.fit(y =  mcycle$accel, x = mcycle$times, knots = seq(0,60,by=2), spar = lambda_seq[which.min(gcv_seq)]))[1:nrow(mcycle)], col=6, lwd = 1.4)
+rm(lambda_seq, ocv_seq, gcv_seq)
+```
+
+
+Remember that $\boldsymbol{A}$ is the hat matrix such that $\hat{y} = \boldsymbol{A} y$, ie we are working with a linear smoother. Then we have that the so called _equivalent degrees of freedom_ (edf) are $edf=tr(\boldsymbol{A})$. This opens the possibility of using methods such as AIC for smoothing parameter selection. 
+
+Once $\lambda$ is selected we can estimate our function and carry out our estimation. There is an interesting line of research which aims at quantifying the uncertainty in the estimation due to the fact that $\lambda$ is not actually known but selected. 
+
+Another approach is to describe the smoothing problem as a linear mixed model and use (restricted) maximum likelihood for mixed effects models. 
+
+Furthermore, we can exploit the fact that penalized regression can be viewed as a Bayesian linear model, in which the prior distribution for the regression parameters is taken to be a Gaussian: when doing so the $\lambda$ parameter is just one more of the parameters for which we need to obtain a posterior distribution. Let's see how penalized regression corresponds to a Bayesian model with a Gaussian prior on the coefficients. 
+
+
+### Bayesian Linear Models 
+
+A Bayesian models with a normal prior on the parameters: 
+
+$$\boldsymbol{y} =  \boldsymbol{X} \boldsymbol{\beta} + \boldsymbol{\varepsilon}$$ 
+
+where $\boldsymbol{\varepsilon}$ is a vector of length $n$ of iid Gaussian error terms with mean 0 and constant known variance $\sigma^2$
+
+We take a prior on the model parameters $\boldsymbol{\beta} \sim MVN(\boldsymbol{0}, \tau I)$ and wish to evaluate the posterior $p(\boldsymbol{\beta}|\boldsymbol{y})$: 
+
+\begin{align*} 
+p(\boldsymbol{\beta}|\boldsymbol{y}) & \propto p(\boldsymbol{y}|\boldsymbol{\beta}) * p(\boldsymbol{\beta})  \\ 
+  & \propto \exp\left\{-\frac{(\boldsymbol{y}- \boldsymbol{X} \boldsymbol{\beta})^T (\boldsymbol{y}- \boldsymbol{X} \boldsymbol{\beta})}{2 \sigma^2} \right\} \ \exp\left\{-\frac{\boldsymbol{\beta}^T \boldsymbol{\beta}}{2 \tau^2} \right\} =
+   \exp\left\{-\frac{1}{2}\left[\frac{1}{\sigma^2}
+   (\boldsymbol{y}^T \boldsymbol{y} - 2\boldsymbol{\beta}^T\boldsymbol{X}^T  \boldsymbol{y} + \boldsymbol{\beta}^T \boldsymbol{X}^T \boldsymbol{X}  \boldsymbol{\beta}) + \frac{1}{\tau^2} \boldsymbol{\beta}^T \boldsymbol{\beta} \right]   \right\}  \\ 
+  & \propto 
+  \exp\left\{-\frac{1}{2}\left[\boldsymbol{\beta}^T \left( \frac{1}{\sigma^2} \boldsymbol{X}^T \boldsymbol{X}  + \frac{1}{\tau^2} \boldsymbol{I} \right) \boldsymbol{\beta} - 
+ 2 \frac{1}{\sigma^2}  \boldsymbol{\beta}^T \boldsymbol{X}^T \boldsymbol{y} \right] \right\}  \\
+   & = 
+  \exp\left\{-\frac{1}{2}\left[\boldsymbol{\beta}^T \boldsymbol{A} \boldsymbol{\beta} - 
+ 2 \boldsymbol{b}^T \boldsymbol{\beta} \right]   \right\} \  \text{ where } \boldsymbol{A} = \left( \frac{1}{\sigma^2} \boldsymbol{X}^T \boldsymbol{X}  + \frac{1}{\tau^2} \boldsymbol{I} \right) , \ \boldsymbol{b} = \frac{1}{\sigma^2} \boldsymbol{X}^T \boldsymbol{y} \\
+	& = 
+	\exp\left\{-\frac{1}{2}\left[(\boldsymbol{\beta}- \boldsymbol{A}^{-1} \boldsymbol{b})^T \boldsymbol{A} (\boldsymbol{\beta}- \boldsymbol{A}^{-1} \boldsymbol{b}) - 
+	\boldsymbol{b}^T \boldsymbol{A}^{-1} \boldsymbol{b} \right] \right\} \propto 
+	\exp\left\{-\frac{1}{2}\left[(\boldsymbol{\beta} - \boldsymbol{A}^{-1} \boldsymbol{b})^T \boldsymbol{A} (\boldsymbol{\beta}- \boldsymbol{A}^{-1} \boldsymbol{b}) \right] \right\}
+\end{align*}
+
+
+Thus $p(\boldsymbol{\beta}|\boldsymbol{y})$ is a $N(\boldsymbol{A}^{-1} \boldsymbol{b}, \boldsymbol{A}^{-1})$
+and interestingly: 
+$$E[\boldsymbol{\beta}|\boldsymbol{y}] = \frac{1}{\sigma^2} \left( \frac{1}{\sigma^2} \boldsymbol{X}^T \boldsymbol{X}  + \frac{1}{\tau^2} \boldsymbol{I} \right)^{-1} \boldsymbol{X}^T \boldsymbol{y} = \left(\boldsymbol{X}^T \boldsymbol{X}  + \frac{\sigma^2}{\tau^2} \boldsymbol{I} \right)^{-1} \boldsymbol{X}^T \boldsymbol{y}$$ 
+
+Thus we see that if we assume a-priori that the coefficients are independent with a common variance we retrieve the ridge regression case. If we were to assume more complex structure in the prior distribution, eg $\boldsymbol{\beta} \sim MVN(\boldsymbol{0}, \tau \boldsymbol{S}^{-})$ we find that the MAP for $\beta$ corresponds to the $\hat{\beta}$ found for penalized regression. 
+
+Let's assess the impact of $\tau$, the prior standard deviation of the $\beta$ coefficients, on the smoothness of the implied functions: 
+
+```{r}
+set.seed(454)
+## let's generate a vector of xs
+n <- 100
+x <- sort(runif(n, 0,1))
+y <- scale(10*sin(2*pi*x)*x+rnorm(n,0,1), scale = FALSE) # 0 mean 
+# cubic spline 
+cSmatrix <- cubSpline(x,seq(0,1,by=0.1))[,-1] # drop the intercept to ensure 0 mean
+p <- ncol(cSmatrix)
+par(mfrow=c(1,3), pch = 16)
+plot(x,y, ylim = c(-10,10))
+for(j in 1:20){
+  # superflous, but more in line with notation
+  # beta_05 <- diag(MASS::mvrnorm(p, rep(0,p), .5*diag(p)))
+  beta_05 <- rnorm(p, 0, .5)
+  lines(x, scale(cSmatrix %*% (beta_05),scale = FALSE), type = "l",col="grey")
+}
+plot(x,y, ylim = c(-10,10))
+for(j in 1:20){beta_5 <- rnorm(p, 0, 5); lines(x,scale(cSmatrix %*% beta_5,scale = FALSE), type = "l",col="grey")}
+plot(x,y, ylim = c(-30,30))
+for(j in 1:20){beta_100 <- rnorm(p, 0, 50); lines(x,scale(cSmatrix %*% beta_100,scale = FALSE), type = "l",col="grey")}
+rm(x,y,j,p,beta_05,beta_5,beta_100,cSmatrix,n)
+```
+
+$\tau$ plays a role similar to $\lambda$: this Bayesian interpretation of GAMs open the opportunity of employing the many libraries developed for Bayesian computation to estimate GAM models. 
+
+
+## Generalised addtive models 
+
+Till now we have use one covariate but in many situations we believe we will have several predictors influencing the variable of interest. 
+For example, for the `airquality` data, we might want to model the ozone levels as a function of several predictors:
+
+```{r}
+data("airquality")
+airquality <- na.omit(airquality) # not best practice... 
+plot(airquality)
+```
+
+i.e. we wish to fit (let's still assume the gaussian case for the moment): 
+$$y_i = \beta_0 + f_1(x_{1i}) + f_2(x_{2i}) + \ldots + f_p(x_{pi}) + \varepsilon_i$$
+where each $f_j(x_j)$ can be represented by a linear combination of basis functions, eg.   $f_1(x_1) = \sum_{j=1}^{k} b_j(x_1) \beta^{(1)}_j$. We can  construct the design matrix for each additive term which can then be defined as a linear combination of the design matrix and the parameter vector, eg $\boldsymbol{f}_1 = \boldsymbol{X_1} \boldsymbol{\beta}^{(1)}$. We also associate a suitable penalty matrix $\boldsymbol{S}_{j}$ to each term. 
+
+Notice that the model can only be estimate under some identifiability constraints since we could add any constant to any $f_j(\cdot)$ and this would be reabsorbed in $\beta_0$. In practice then the estimation is carried out under the constraint that each $f_j(\cdot)$ term has a zero mean, eg $\sum_{i=1}^{n} f_1(x_{1i}) = 0$ so $\boldsymbol{1}^\top \boldsymbol{f}_1= 0$ and $\boldsymbol{1}^\top \boldsymbol{X}_1 \boldsymbol{\beta}^{(1)} = 0$ for all $\boldsymbol{\beta}^{(1)}$, which implies $\boldsymbol{1}^\top \boldsymbol{X}_1 = 0$. This is achieved when employing a centered matrix, ie when subtracting to each column its mean: 
+$$\tilde{\boldsymbol{X}}_1 = \boldsymbol{X}_1 - \boldsymbol{1} \boldsymbol{1}^\top \boldsymbol{X}_{1}/n.$$
+This implies that we only need to estimate $k-1$ parameters rather than $k$: we can simply delete one column out of $\boldsymbol{X}_1$ and the $\boldsymbol{S}_1$ matrix to construct the appropriate $\tilde{\boldsymbol{X}}_1$ and $\tilde{\boldsymbol{S}}_{1}$ matrices
+
+```{r}
+tf.Xc <- function(x,knots, cmx=NULL){
+  nk <- length(knots); n <- length(x)
+  X <- tf.X(x=x,knots=knots)[,-nk] # remove one column
+  D <- diff(diag(nk), differences  = 2)[,-nk]
+  # cmx is the column means 
+  # needed to evaluate function at new locations 
+  if(is.null(cmx)) cmx <- colMeans(X)
+  X <- sweep(X, 2, cmx)
+  list(X=X,D=D,cmx=cmx)
+}
+dim(tf.X(mcycle$times, knots = seq(0,60,length.out=15)))
+dim(tf.Xc(mcycle$times, knots = seq(0,60,length.out=15))[["X"]])
+mean(tf.X(mcycle$times, knots = seq(0,60,length.out=15)) %*% rnorm(15,1,2))
+mean(tf.Xc(mcycle$times, knots = seq(0,60,length.out=15))[["X"]] %*% rnorm(14,1,2))
+```
+
+
+Since each component has a zero mean the interpretation of $f_j(\cdot)$ will be that of the relative contribution of the covariate to the response. 
+
+The model can then be rewritten in general form as: 
+
+$$\boldsymbol{y} = \beta_0 + \boldsymbol{f}_1 + \boldsymbol{f}_2 + \ldots + \boldsymbol{f}_p = \beta_0 + \tilde{\boldsymbol{X}}_1 \boldsymbol{\beta}^{(1)}+ \tilde{\boldsymbol{X}}_2 \boldsymbol{\beta}^{(2)} + \ldots + + \tilde{\boldsymbol{X}}_p \boldsymbol{\beta}^{(p)} = \boldsymbol{X} \boldsymbol{\beta}$$
+where $\boldsymbol{X} = [\boldsymbol{1} \ \tilde{\boldsymbol{X}}_1 \cdots \tilde{\boldsymbol{X}}_p]$ and $\boldsymbol{\beta} = [\beta_0 \ \boldsymbol{\beta}^{(1)} \cdots \boldsymbol{\beta}^{(p)}]$.
+The estimation is carried out using a penalized regression and each component can be penalized accordingly. To facilitate the notation later one, it is easier to express each of the penalties as quadratic penalties for of all parameters, for example: 
+$$\boldsymbol{P}_1 = \begin{bmatrix} 
+0 & \boldsymbol{0} & \boldsymbol{0} \\
+\boldsymbol{0} & \boldsymbol{\tilde{S}_1} & \boldsymbol{0} \\
+\vdots & \vdots & \vdots \\
+\boldsymbol{0} & \boldsymbol{0}  & \boldsymbol{0} \\
+\end{bmatrix} 
+$$
+
+so that 
+$$\boldsymbol{\beta}^\top \boldsymbol{P}_1 \boldsymbol{\beta} =  \boldsymbol{\beta}^{(1) T} \tilde{\boldsymbol{S}}_1 \boldsymbol{\beta}^{(1)}$$
+
+Notice that we can have parametric terms such as $f_j(x_j) = \delta x_j$ by simply adding a 0 in the penalty matrix for the rows corresponding to the $j^{th}$ component (hence these approaches are often referred to as semi-parametric regression). 
+
+The estimates of $\boldsymbol{\beta}$ are found as the minimizer of: 
+$$||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \sum_{j=1}^{p} \lambda_j \boldsymbol{\beta}^{(j) T} \boldsymbol{P}_{j} \boldsymbol{\beta}^{T} = ||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + \boldsymbol{\beta} \boldsymbol{B}^\top \boldsymbol{B} \boldsymbol{\beta}=
+ \left\Vert  \begin{bmatrix} \boldsymbol{y} \\ \boldsymbol{0} \end{bmatrix} - \begin{bmatrix} \boldsymbol{X} \\ \boldsymbol{B} \end{bmatrix} \boldsymbol{\beta} \right\Vert^2$$
+where $\boldsymbol{B}$ is a matrix such that $\boldsymbol{B}^\top \boldsymbol{B} = \sum_{j=1}^{p} \lambda_j \boldsymbol{\beta}^{(j) T} \boldsymbol{P}_{j} \boldsymbol{\beta}^{(j)}$, such as, for example
+
+$$\boldsymbol{B} = \begin{bmatrix} 
+\boldsymbol{0} & \sqrt{\lambda_1} \boldsymbol{D}_1 & \boldsymbol{0} \\
+\vdots & \vdots & \vdots \\
+\boldsymbol{0} & \boldsymbol{0} & \sqrt{\lambda_p} \boldsymbol{D}_p \\
+\end{bmatrix} 
+$$
+
+The estimate for $\boldsymbol{\beta}$ is found to be
+
+$$\hat{\boldsymbol{\beta}} = \left(\boldsymbol{X}^T \boldsymbol{X}  + \lambda_1 \boldsymbol{P}_1  + \ldots+ \lambda_p \boldsymbol{P}_p \right)^{-1} \boldsymbol{X}^T \boldsymbol{y}.$$
+
+although in practice, for computational stability, we can use the augmented variables approach. 
+
+Let's now see how the ozone levels change as a function of solar radiation and wind. First we construct the design matrix for the whole model: 
+
+```{r}
+data("airquality")
+airquality <- na.omit(airquality)
+plot(airquality[,c("Solar.R","Wind","Ozone")])
+# create basis functions and D matrices for each predictor 
+Msolar <- tf.Xc(x = airquality$Solar.R, knots = seq(min(airquality$Solar.R), max(airquality$Solar.R), length.out = 15))
+Mwind <- tf.Xc(x = airquality$Wind, knots = seq(min(airquality$Wind), max(airquality$Wind), length.out = 12))
+# number of coefficients for each predictor 
+p1 <- ncol(Msolar$X); p2 <- ncol(Mwind$X)
+# the overall design matrix 
+X <- cbind(rep(1,nrow(airquality)), Msolar$X, Mwind$X)
+# create the P1 and P2 matrices - they are mostly 0s 
+Psolar <- matrix(0,ncol=1+p1+p2, nrow = 1+p1+p2); Psolar[2:(1+p1),2:(1+p1)] <-  crossprod(Msolar$D) 
+Pwind <- matrix(0,ncol=1+p1+p2, nrow = 1+p1+p2); Pwind[(2+p1):(p1+p2+1),(2+p1):(p1+p2+1)] <- crossprod(Mwind$D) 
+# take arbitrary lambdas 
+sp1 <- 6; sp2 <- 4
+# a first rough estimate with the direct approach 
+betafit <- (solve(crossprod(X) + sp1 * Psolar + sp2*Pwind) %*% t(X) %*% airquality$Ozone)[,1]
+# let's look at the effect of each component 
+par(mfrow=c(1,2))
+plot(sort(airquality$Solar.R), 
+     X[order((airquality$Solar.R)),2:(1+p1)] %*% betafit[2:(1+p1)], 
+     type = "l", ylab = "f(Solar.R)") # ylim = c(-20,75)
+plot(sort(airquality$Wind), 
+     X[order((airquality$Wind)),(2+p1):(1+p1+p2)] %*% betafit[(2+p1):(1+p1+p2)], 
+     type = "l", ylab = "f(Wind)") # ylim = c(-20,75)
+# constraints on the mean effect of each term 
+mean(X[order(airquality$Solar.R),2:(1+p1)] %*% betafit[2:(1+p1)])
+mean(X[order(airquality$Wind),(2+p1):(1+p1+p2)] %*% betafit[(2+p1):(1+p1+p2)])
+## for numerical stability it is better to exploit the optimized routines in lm 
+## use the augmented model
+# construct the B matrix 
+B <- matrix(0,nrow = p1+p2-1, ncol = p1+p2+1); 
+B[2:(p1),2:(p1+1)] <-  Msolar$D * sqrt(sp1); B[(1+p1):(p1+p2-1),(p1+2):(p1+p2+1)]<-Mwind$D * sqrt(sp2)
+# augment y and X 
+yaugment <- c(airquality$Ozone, rep(0,  p1+p2-1))
+Xaugment  <- rbind(X,B) 
+# use lm to carry out the estimation 
+coef(lm(yaugment~Xaugment-1))/betafit # same result
+# how complex is the model we have obtained? 
+rm(X,B,yaugment,Xaugment,p1,p2,betafit,sp1,sp2,Psolar,Pwind,Mwind,Msolar)
+```
+
+Notice that for given $\lambda_1$ and $\lambda_2$ the model is estimated in one unique solution, avoiding backfitting. 
+
+### mgcv 
+
+Luckily for us we do not need to construct the whole model by hand but we can use packages which are optimized and well tested. The `mgcv` package, developed by [Simon Wood](https://www.maths.ed.ac.uk/~swood34/) is *the* R package to model generalised additive models, although later I list a number of other packages which are also very relevant. Let's see `mgcv` in practice:  
+
+```{r class.source = 'fold-show'}
+suppressPackageStartupMessages(library(mgcv))
+fit_aq <- gam(Ozone~s(Solar.R)+s(Wind), data = airquality) # s() to obtain smooth terms 
+# similar in structure to a summary.lm 
+summary(fit_aq)
+par(mfrow=c(1,2))
+plot(fit_aq) # by default mgcv plots 95% confidence intervals 
+```
+
+Reading the help file of `?gam` is very instructive. We see that by default the data is assumed to follow a Gaussian distribution, but a number of families are allowed. The estimation for distributions which are not the Gaussian typically is based on using the log-likelihood rather than the squared residual as the goodness of fit measure in the penalized regression. Similarly to what happens in GLM, computations need to be adapted, but solutions can be found. 
+
+The `method` option controls the method used to choose the smoothing parameter: the default is "GCV.Cp" (ie a GCV with appropriate correction for the scale when this is unknown), but we see many other options: "REML" is based on the mixed model representation of GAMs and has been shown to perform better than GCV in practice (Reiss and Ogden, 2009, JRSSB, doi:10.1111/j.1467-9868.2008.00695.x). 
+
+In our manual estimation of GAM models we have mostly used the tent function to fit out model: tent function are composed by polynomials of order 1 and hence can only estimate functions with moderate flexibility. In practice we typically used cubic regression splines, which can estimate function with continuous second order derivatives at the knots or use thin plate regression splines, a low-rank approximation of thin plate splines. Indeed thin-plate regression splines are the default basis for the `mgcv` package - as we can learn looking at `?s`. 
+
+We can deviate from the defaults and use, for example, cubic regression splines with a larger number of knots and REML for smoothing parameter selection: 
+
+```{r class.source = 'fold-show'}
+fit2_aq <- gam(Ozone~s(Solar.R,k=15, bs = "cr")+s(Wind, k=12, bs = "cr"), data = airquality, method = "REML")
+# similar in structure to a summary.lm 
+summary(fit2_aq)
+par(mfrow=c(1,2))
+plot(fit2_aq) 
+length(coef(fit_aq)); length(coef(fit2_aq))
+fit_aq$df.residual; fit2_aq$df.residual
+```
+
+Even if we have estimated a much high number of coefficients in the second model we end up using a similar number of equivalent degrees of freedom: the automatic smoothing parameter selection results in similar estimated function. 
+
+
+Some small plots to comment on interesting aspects of the fit:
+
+```{r}
+# after all - we are actually fitting a linear model
+# let's see what happens for the Wind variable 
+X <- model.matrix(fit2_aq)[order(airquality$Wind),]
+plot(fit2_aq, select = 2, se = FALSE, rug = FALSE, lwd = 2) 
+lines(sort(airquality$Wind), 
+      X[,grep("Wind",colnames(X))] %*% coef(fit2_aq)[grep("Wind",colnames(X))], 
+      lty = 4, col = "red",lwd = 1.8)
+# Let's look at the columns of the model matrix - 
+plot(sort(airquality$Wind), 
+      X[,grep("Wind",colnames(X))][,1], type="l", ylim = c(-.5,1.5),ylab="Basis") 
+for(j in 2:length(grep("Wind",colnames(X)))) lines(sort(airquality$Wind),X[,grep("Wind",colnames(X))][,j],col=j)
+rm(X,j)
+```
+
+### Some useful basis 
+
+We now explore some useful basis functions available in GAM which allow for the estimation of fairly complex models in the same framework of penalized regression used in GAM smoothing: we start with an example of varying coefficient models (taken from the excellent book *Bayesian and Frequentist Regression Methods* by Jon Wakefield). 
+
+```{r}
+data(ethanol, package = "SemiPar")
+ethanol <- ethanol[order(ethanol$E),] 
+# help(ethanol)
+with(ethanol, plot(NOx,C, pch = 16))
+par(mfrow=c(2,2), pch = 16)
+with(ethanol[ 1:22,], plot(NOx ~ C)); with(ethanol[ 1:22,], abline(lm(NOx ~ C)))
+with(ethanol[23:44,], plot(NOx ~ C)); with(ethanol[23:44,], abline(lm(NOx ~ C)))
+with(ethanol[45:66,], plot(NOx ~ C)); with(ethanol[45:66,], abline(lm(NOx ~ C)))
+with(ethanol[67:88,], plot(NOx ~ C)); with(ethanol[67:88,], abline(lm(NOx ~ C)))
+# effect of NOx on C is different for different levels of E 
+```
+
+
+We wish to have a model such that rather taking $\text{C}_i = \beta_0 + \beta_1 \text{Nox}_i + \varepsilon_i$ we allow the values of the intercept and slope to change as a (smooth) function another predictor $E$.
+
+We can set this us taking $\beta_0(E) = f_0(E) = \boldsymbol{B}_0(E) \boldsymbol{\delta}$ and $\beta_1(E) = f_1(E) = \boldsymbol{B}_1(E) \boldsymbol{\gamma}$, where $\boldsymbol{B}_0$ and $\boldsymbol{B}_1$ are some splines basis.  
+We therefore can write
+$$\text{C}_i = \boldsymbol{B}_0(E_i) \boldsymbol{\delta}  + \boldsymbol{B}_1(E_i) \boldsymbol{\gamma} \text{Nox}_i + \varepsilon_i$$
+which can be easily rewritten into a matrix form of the usual $\boldsymbol{X} \boldsymbol{\beta}$ type. The estimation follows the usual minimization of $||\boldsymbol{y} - \boldsymbol{X} \boldsymbol{\beta}||^2 + penalty$.   
+
+In `mgcv` this can be achieved using the `by` argument in `s`: 
+
+```{r}
+fit_eth <- gam(NOx~s(E,bs="cr")+s(E,by=C,bs="cr"), data = ethanol)
+summary(fit_eth) 
+# effective degrees of freedom of 6.4 and 4.7 on the intercept and slope smooths
+par(mfrow=c(1,2))
+plot(fit_eth, scale = 0)
+# how are values fitted values  
+predict(fit_eth, newdata = data.frame(E=1.2,C=c(10,16)), type = "terms")
+predict(fit_eth, newdata = data.frame(E=1.2,C=c(10,16)))
+predict(fit_eth, newdata = data.frame(E=0.6,C=c(10,16)), type = "terms")
+predict(fit_eth, newdata = data.frame(E=0.6,C=c(10,16)))
+# notice we have the usual functions we expect for linear model 
+```
+
+
+Let's look at the basis function for each of the terms: 
+
+```{r class.source = 'fold-show'}
+# Let's look at the columns of the model matrix - 
+X <- model.matrix(fit_eth)
+#colnames(X)
+# basis used to estimate the intercept
+plot(ethanol$E, 
+      X[,grep("E)[.]",colnames(X))][,1], type="l", ylim = c(-.5,1.5),ylab="Basis")
+title(main="Basis for the varying intercept")
+for(j in 2:length(grep("E)[.]",colnames(X)))) lines(ethanol$E,X[,grep("E)[.]",colnames(X))][,j],col=j)
+# basis for the slope 
+plot(ethanol$E, 
+      X[,grep("E)[:]",colnames(X))][,1], type="l", ylim = c(-2.5,4.5),ylab="Basis")
+title(main="Basis for the varying slope")
+for(j in 2:length(grep("E)[:]",colnames(X)))) lines(ethanol$E,X[,grep("E)[:]",colnames(X))][,j],col=j)
+# something looks off 
+plot(ethanol$E, 
+      X[,grep("E)[:]",colnames(X))][,1]/ethanol$C, type="l", ylim = c(-.5,1.5),ylab="Basis")
+title(main="Basis for the varying slope - processed")
+for(j in 2:length(grep("E)[:]",colnames(X)))) lines(ethanol$E,X[,grep("E)[:]",colnames(X))][,j]/ethanol$C,col=j)
+# back to normal - the actual basis is obtained by multiplying the original basis and the _by_ predictor 
+rm(X,j)
+```
+
+The varying coefficient model is one of the simplest models which showcases one incredible advantage of the GAM-style of fitting based on penalized likelihood: as long as we can express the relationship between the (link-transformed) response and the predictor(s) as a linear combination $\boldsymbol{X} \boldsymbol{\beta}$ subject to some constraints $\boldsymbol{\beta}^\top \boldsymbol{S} \boldsymbol{\beta}$ we can use the GAM-style machinery to estimate the model (and evaluate the smoothness/regularization on the estimated function). This includes an incredibly vast class of model, including geo-additive models, cluster-specific random effects, multi-variate tensor products of several predictors... Due to the richness of the type of relationship between the predictors and the response, Fahrmeir et al, among others use the name Structured Additive Regression (STAR) Models. Notice though that event when multi-variable tensor products can be employed the "restriction" of the model being additive can not fully be relaxed (yet!). 
+
+In `mgcv` several types of predictors can be included, an overview can be seen in `?smooth.terms`. 
+
+
+### The G of GAMs
+
+Until now we have analysed data assuming a Gaussian distribution: this is hardly a general assumption, real data come in all forms, for example they might be discrete and/or skewed. `mgcv` allows for different distributions to be estimated: this can be specified via the `family` option. Let's look for example at the precipitation data from the German climate data: precipitation is by definition skewed and can only be positive, we could employ a Gamma distribution. Looking at the data though it is clear that something radically change in the data recording procedure around 1878: we only focus on the record after that year: 
+
+```{r}
+with(climDat, plot(year+(month-1)/12, Precip, pch = 16))
+abline(v=1878, col = 2)
+```
+
+(don't forget that careful checks on the data are still a key element even when you can use advanced modelling techniques). 
+
+
+```{r}
+subclim <- climDat[climDat$year > 1878,] 
+par(mfrow=c(1,2))
+with(subclim, plot(year+(month-1)/12, Precip, pch = 16))
+with(subclim, plot(month, Precip, pch = 16)) #  strong seasonal component 
+# let's fit a GAM
+fit_precip <- gam(Precip ~ s(year, k=20)+s(month, k = 12), family = "Gamma", data = subclim)
+summary(fit_precip)
+plot(fit_precip) # the term plots 
+```
+
+We see that the seasonal variation dominates the signal, a small trend in time is visible, but it is not a very noticeable signal (compare it to the one we can obtain for the temperature data, which can be assumed to be normally distributed). 
+
+We have included month as if it was a continuous variable, but in reality we only have 12 possible values and the variable is not really continuous, but rather a cyclical, since 1 comes after 12. We can enforce the basis used to model a smooth term to take the same value in the last and first knot, and if we also enforce that the first and last parameter for the smooth term are equal, we obtain that the value at the first and last covariate value are the same: this can avoid awkward large discontinuities where we would actually want the function to be continuous. This can be obtained with cyclic splines, and using the `bs="cc"` option in `s`: 
+
+```{r}
+par(mfrow=c(1,2))
+# let's fit a GAM
+fit2_precip <- gam(Precip ~ s(year, k=20)+s(month, bs = "cc", k = 12), 
+                   family = "Gamma", data = subclim)
+# one less parameter to estimate
+#dim(model.matrix(fit_precip)); dim(model.matrix(fit2_precip))
+summary(fit2_precip)
+plot(fit2_precip) 
+```
+
+The fit is not radically different. Let's compare the first 36 fitted values: 
+
+```{r}
+plot(predict(fit_precip, terms = "s(month)")[1:36], type = "l")
+lines(predict(fit2_precip, terms = "s(month)")[1:36], type = "l", col = 2)
+predict(fit_precip, terms = "s(month)")[c(12,13,24,25)]
+predict(fit2_precip, terms = "s(month)")[c(12,13,24,25)]
+```
+
+We notice that December and January are forced to have the same value. For this application this might be somewhat restrictive, but when data is available at a finer scale (minute of the day, or angles around a circle) there could be some benefit in enforcing the end and the beginning of the record to have matching values. 
+
+From the plots and the commands used above we notice that `mgcv::gam` operates in a way similar to `glm`: the actual estimation is carried out in the link-transformed space and the inverse link needs to be employed when we wish to retrieve estimates of the distribution's expected value:
+
+```{r}
+1/predict(fit_precip)[1:10]
+fitted(fit_precip)[1:10]
+```
+
+A list of distributions available for `mgcv` (which are well beyond the exponential family) can be retrieved at `?family.mgcv`. Some of these are indicated as location-scale: for these distributions we allow parameters other than the location to also depend on the predictor, thus constructing generalized additive models for location, scale and shape (GAMLSS). 
+
+
+## Not flexible enough - beyond the mean 
+
+(I stole the title of the subsection from Thomas Kneib's [excellent paper](https://journals.sagepub.com/doi/10.1177/1471082X13494159)). 
+
+Sometimes we find that it is not only the mean of our data that varies, but other properties at well. In the precipitation record we just analysed for example in the summer months we observe higher means and higher variability. Since the Gamma is already modeled taking $Var(Y) = \phi \mu$ we might think that we would capture this feature of the data in out model, but we can actually notice that the coefficient of variation is lower in the summer months. The increase in precipitation comes with a smaller increase in variation that the one seen in the winter months, while no clear signal is noticeable in the year to year signal: 
+
+```{r}
+par(mfrow=c(1,2))
+plot(tapply(subclim$Precip,subclim$month,function(x) log(sd(x) / mean(x))), type="l", ylab = "CV")
+plot(tapply(subclim$Precip,subclim$year,function(x) log(sd(x) / mean(x))), type="l", ylab = "CV")
+```
+
+We can then ask `mgcv` to also model the *scale* of the distribution: 
+
+```{r}
+fitls_precip <- gam(list(
+                         Precip ~ s(year, k=20)+s(month, k = 12), # a model for the mean 
+                         ~ s(year, k=20)+s(month, k = 12)), # a model for the scale
+                    family = gammals, data = subclim, method = "REML", optimizer = "efs")
+summary(fitls_precip)
+plot(fitls_precip, page = 1)
+```
+
+(notice that `gammals` uses the identity link for the log-location, rather than the inverse used by `Gamma`)
+
+We see that the scale appears to be changing with month, but no effect is found for `year`, we can change our model accordingly: 
+
+```{r}
+fitls_precip <- gam(list(
+                         Precip ~ s(year, k=20)+s(month, k = 12), # a model for the mean 
+                         ~ s(month, k = 12)), # a model for the scale
+                    family = gammals, data = subclim, method = "REML", optimizer = "efs")
+summary(fitls_precip)
+plot(fitls_precip, page = 1)
+```
+
+We can plot the fitted location ans scale (only the first 40 years to avoid clogging the figure): 
+
+```{r}
+plot(fitted(fitls_precip)[1:480,1], type="l", main = "The location function")
+plot(fitted(fitls_precip)[1:480,2], type="l", main = "The scale function")
+```
+
+(Notice that the scale function is on a non-intuitive scale, i.e. the log of the actual scale)
+
+`mgcv` does not provide much flexibility in terms of link functions and specific choices of modelling strategies for the scale parameters. Indeed the location-scale models are a fairly recent addition to `mgcv`, as they are computationally quite challenging, especially when one also wishes to automatically (automagically?) estimate the smoothing parameter for all model components of several distribution parameters. Therefore the number of location-scale-shape models which are already implemented in `mgcv` is somewhat limited (although it is not too complicated to add new distributions if one wishes to exploit the package's capabilities). 
+
+Indeed, with all their flexibility, GAMs are still actually quite restrictive in terms of the distributions that can be employed as the response and in terms of which properties of the distributions can be modeled: to overcome these restrictions some further generalizations have been proposed. In particular we can extend GL/AMs by relaxing the assumption that the distribution of the response variable should belong to the exponential family of distributions, but simply assume that it belongs to a distribution $\mathcal{D}(y, \boldsymbol{\theta})$, where $\boldsymbol{\theta}$ can be a multivariate vector, for example $\boldsymbol{\theta} = (\mu, \sigma, \nu, \tau)$, where the latter two parameters are shape parameters which might be useful to describe the skewness and kurtosis of a distribution. For several commonly employed distributions, such as those belonging to the exponential family, the skewness and kurtosis are fully determined by the location and scale, but in several application we might wish to have more flexibility to describe the peculiar behavior of the data and would need to also include additional parameters. 
+Furthermore, extending the concepts related to generalized additive models we can assume that each of the parameters indexing the distributions might vary as a smooth function of one or more predictors. 
+
+Summarizing we assume that, conditional on the covariates vector $\boldsymbol{x_i} =(x_{1i}, \ldots , x_{pi})$, the observations $y_i$ are assumed to be independent realizations of a random variable $Y_i$ which follows a distribution $\mathcal D$ indexed by $K$ parameters: $(Y_i|\boldsymbol{X_i} =\boldsymbol{x_i}) \sim \mathcal D(\theta_{1i}, \ldots, \theta_{Ki})$. Each distribution parameter is assumed to be related to a linear predictor $\eta_i^{\theta_k}$ which is taken to be of the form: 
+\begin{equation}
+\eta_i^{\theta_{k}} = g(\theta_{ki}) = \beta_0^{\theta_{k}} + f_1^{\theta_{k}}(x_{1i}) + \ldots + f_p^{\theta_k}(x_{pi})
+\end{equation}
+where the $f^{\theta_{k}}_j(x_{ji})$ components might represent parametric or unknown functions of the covariates which might be represented by penalized regression. Notice that a suitable link function needs to be chosen for each parameter and that there is no restriction that the same covariates need to be employed as predictors for the different parameters. 
+
+Since these models allow for the modelling of the location, scale and shape of the distribution they have been named Generalized Additive Models for Location Scale and Shape (GAMLSS) by Stasinopoulos et al (2020). The term distributional regression is also employed to indicate GAMLSS and other flexible models to emphasize that the whole distribution of the process of interest conditional to the predictors is the aim of the statistical inference (see for example Kneib et al. doi:10.1016/j.ecosta.2021.07.006). 
+
+### `gamlss` 
+
+We briefly show how to use the `gamlss` package to fit a model for location, scale and shape. We start with the same model for the precipitation data based on the location and scale of a Gamma distribution: 
+
+
+```{r}
+library(gamlss)
+fitgamlss_precip <- gamlss(Precip ~ pb(year)+pb(month), # a model for the mean
+                           sigma.formula = ~ pb(month), # a model for the scale
+                     family = GA, data = subclim[,c("month","year","Precip")])
+summary(fitgamlss_precip)
+plot(fitgamlss_precip) # a different default for what to plot
+# similar effects to what mgcv found
+# to plot the terms we need to use predict/predcitAll 
+par(mfrow=c(2,2))
+pout <- predictAll(fitgamlss_precip, type = "terms")
+plot(subclim$year, pout$mu[,1], type="l",ylab="mu(year)")
+plot(seq(1,12), pout$mu[1:12,2], type="l",ylab="mu(month)")
+plot(seq(1,12), pout$sigma[1:12,1], type="l",ylab="sigma(month)")
+```
+
+The recommended smoother in `gamlss` is `pb`, which automatically selects the smoothing parameter and build upon P-splines. Other basis functions can also be used, including structured ones such as, for example, random effects or gaussian markov random fields. 
+
+We notice that the model residuals are somewhat left-skewed and have higher kurtosis than a normal distribution. Ideally quantile residuals should behave gaussian-like, so it is possible that the distribution we are using is too restrictive for our data, we can explore whether a three- or four-parameter distribution leads to a better fit in the data. Furthermore, by adding an additional shape parameter we can assess whether this changes as a function of some covariate: for example we could assess whether there is evidence that the skewness of the distribution is changing in time as a result of the impacts of climate change. As a first step we employ a more flexible distribution which has additional skewness and kurtosis parameters and then assess whether these are changing as a function of covariates. The `gamlss.dist` package implements a large number of distributions, we explore here the BCCG distribution which is parametrized by three parameters and can capture additional skewness in the distribution: 
+
+
+```{r}
+fitgamlss2_precip <- gamlss(Precip ~ pb(year)+pb(month), # a model for the mean
+                            sigma.formula = ~ pb(month), # a model for the scale
+                            nu.formula = ~ 1,            # no model for shape yet
+                     family = BCCG(), data = subclim[,c("month","year","Precip","TMean")])
+summary(fitgamlss2_precip)
+plot(fitgamlss2_precip) #  residuals a bit better behaved 
+# to plot the terms we need to use predict/predcitAll 
+par(mfrow=c(2,2))
+pout <- predictAll(fitgamlss2_precip, type = "terms")
+plot(subclim$year, pout$mu[,1], type="l",ylab="mu(year)")
+plot(seq(1,12), pout$mu[1:12,2], type="l",ylab="mu(month)")
+plot(seq(1,12), pout$sigma[1:12,1], type="l",ylab="sigma(month)")
+```
+
+We see that the additional parameter captures the additional skewness. We could indeed assess whether the shape of the distribution also changes a function of some covariate. 
+
+
+```{r}
+fitgamlss3_precip <- gamlss(Precip ~ pb(year)+pb(month), # a model for the mean
+                            sigma.formula = ~ pb(month), # a model for the scale
+                            nu.formula = ~ pb(year),     # is the skewness of the distribution changing? 
+                     family = BCCG(), data = subclim[,c("month","year","Precip")])
+summary(fitgamlss3_precip)
+plot(fitgamlss3_precip)
+# to plot the terms we need to use predict 
+# similar effects to what found before
+par(mfrow=c(2,2))
+pout <- predictAll(fitgamlss3_precip, type = "terms")
+plot(subclim$year, pout$mu[,1], type="l",ylab="mu(year)")
+plot(seq(1,12), pout$mu[1:12,2], type="l",ylab="mu(month)")
+plot(seq(1,12), pout$sigma[1:12,1], type="l",ylab="sigma(month)")
+plot(subclim$year, pout$nu, type="l",ylab="nu(year)")
+```
+
+
+Overall GAM(LSS) offer a great deal of flexibility in our modelling, this addiotional flexibility requires careful checks of the modelling assumptions which are not discussed here but should be part of a real data analysis. These are based on the same principles as in GLM 
+
+
+
+## Other approaches/material
+
+As you might have noticed `mgcv` is very `base-R` oriented, but packages exist to make their manipulation more tidyverse compliant: `broom` has tidyers for `gam` objects and Gavin Simpson develops and maintains [`gratia`](https://gavinsimpson.github.io/gratia/), which provides functions to plot outputs of `gam` objects via ggplot (his [blog](https://gavinsimpson.github.io/gratia/) and papers are an excellent source of material on GAMs, mostly skewed on mgcv). 
+
+
+Rigby and Stasinopoulos (2005, 10.1111/j.1467-9876.2005.00510.x) introduced the concept of GAMLSS and develop and maintain the original `gamlss` package and [project](https://www.gamlss.com/). The package implements almost 100 distributions which can be employed as distributions for the response variable. A number of smoothers are implemented, and several strategies can be implemented for smoothing parameter selection. 
+
+The Rigby and Stasinopoulos approach is mostly frequentist, while a fully Bayesian approach to additive models for location scale and shape is taken by Umlauf et al. (2021, 10.18637/jss.v100.i04) in their `bamlss` package, which employs `mgcv` functions to construct the basis and penalty matrix and can fit all families implemented in `gamlss` and additional families included in `bamlss`. One of the interesting distributions implemented in `bamlss` is the Asymmetric Laplace distribution which allows for the smooth estimation of quantile regression. 
+
+
+Finally [`brms`](https://paul-buerkner.github.io/brms/) is a very general purpose package for Bayesian regression modelling via Stan - the package has a helpful [vignette](https://paul-buerkner.github.io/brms/articles/brms_distreg.html) introducing how `brms` implements distributional regression models. The `brms` implementation of smoothing is fully Bayesian and exploits the mixed model representation of penalized regression (TJ Mahr has a very clear dissection of this in his [blog post](https://www.tjmahr.com/random-effects-penalized-splines-same-thing/)). 
+
+
+The `VGAM` package, developed and maintained by T. Yee, further allows for multi-variate responses, a large number of smoothers and distributions. 
+
+

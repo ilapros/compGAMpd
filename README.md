@@ -6,3 +6,4 @@ You will need the mgcv and gamlss packages, we also use data from the SemiPar pa
 
 Most material inspiered from Simon Wood's GAM book. 
 
+A [tweet](https://twitter.com/betanalpha/status/1632554389767442433?s=20) summarising distributional regression. 
